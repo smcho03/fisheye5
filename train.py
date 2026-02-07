@@ -133,6 +133,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 depth_loss = l1_loss(render_pkg["depth"], viewpoint_cam.depth_image)
                 loss = loss + 0.1 * depth_loss
         
+        # iteration 100에 추가
+        # 여러 iteration에서 저장
+        if iteration % 1000==0:
+            from utils.debug_fisheye import save_cubemap_debug, visualize_mapping, save_fisheye_comparison
+            import os
+            
+            if is_fisheye:
+                debug_base = os.path.join(dataset.model_path, f"debug_iter_{iteration}")
+                os.makedirs(debug_base, exist_ok=True)
+                
+                '''
+                cubemap_faces = render_pkg.get("cubemap_faces")
+                if cubemap_faces is not None:
+                    output_dir = os.path.join(debug_base, "cubemap")
+                    save_cubemap_debug(cubemap_faces, output_dir)
+                
+                if cache_key in fisheye_mapping_cache:
+                    cache = fisheye_mapping_cache[cache_key]
+                    viz_path = os.path.join(debug_base, "mapping_viz.png")
+                    visualize_mapping(
+                        cache['face_idx'],
+                        viewpoint_cam.image_height,
+                        viewpoint_cam.image_width,
+                        viz_path
+                    )
+                '''
+                    
+                
+                comparison_path = os.path.join(debug_base, "fisheye_comparison.png")
+                save_fisheye_comparison(image, gt_image, comparison_path)
+                
         loss.backward()
 
         iter_end.record()

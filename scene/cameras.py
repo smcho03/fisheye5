@@ -77,7 +77,7 @@ class Camera(nn.Module):
             self.depth_image = torch.from_numpy(depth_image).to(self.data_device)
         else:
             self.depth_image = None
-        print(f"Created FisheyeCamera {self.uid}, memory footprint check")
+
 
 class FisheyeCamera(nn.Module):
     """
@@ -153,67 +153,55 @@ class FisheyeCamera(nn.Module):
     
 
     def create_cubemap_cameras(self):
-        """
-        Fisheye 카메라 위치에서 6개 방향의 Cubemap 카메라 생성
-        
-        Returns:
-            list of Camera: 6개의 Pinhole 카메라 [+X, -X, +Y, -Y, +Z, -Z]
-        """
+        """OpenGL 표준 cubemap 방향"""
         cubemap_cameras = []
         
-        # Cubemap face size (정사각형)
-        # Fisheye 이미지 크기를 기반으로 적절한 크기 설정
-        face_size = 1700
+        # 고정된 크기와 FOV
+        face_size = 1024
+        fov = math.pi / 2.0  # 정확히 90도
         
-        # 90도 FOV (cubemap은 각 face가 90도)
-        fov = math.pi / 2.0  # 90 degrees in radians
-        
-        # Cubemap 6개 방향의 회전 행렬
-        # Order: [+X(right), -X(left), +Y(up), -Y(down), +Z(front), -Z(back)]
+        # OpenGL standard cubemap rotations
         rotations = [
-            # +X (right): 왼쪽으로 90도 회전
-            np.array([[0, 0, 1],
-                     [0, 1, 0],
-                     [-1, 0, 0]]),
-            
-            # -X (left): 오른쪽으로 90도 회전
+            # +X (right)
             np.array([[0, 0, -1],
-                     [0, 1, 0],
-                     [1, 0, 0]]),
+                    [0, -1, 0],
+                    [-1, 0, 0]]),
             
-            # +Y (up): 위로 90도 회전
+            # -X (left)
+            np.array([[0, 0, 1],
+                    [0, -1, 0],
+                    [1, 0, 0]]),
+            
+            # +Y (up)
             np.array([[1, 0, 0],
-                     [0, 0, -1],
-                     [0, 1, 0]]),
+                    [0, 0, 1],
+                    [0, -1, 0]]),
             
-            # -Y (down): 아래로 90도 회전
+            # -Y (down)
             np.array([[1, 0, 0],
-                     [0, 0, 1],
-                     [0, -1, 0]]),
+                    [0, 0, -1],
+                    [0, 1, 0]]),
             
-            # +Z (front): 그대로
+            # +Z (forward)
             np.array([[1, 0, 0],
-                     [0, 1, 0],
-                     [0, 0, 1]]),
+                    [0, -1, 0],
+                    [0, 0, -1]]),
             
-            # -Z (back): 180도 회전
+            # -Z (back)
             np.array([[-1, 0, 0],
-                     [0, 1, 0],
-                     [0, 0, -1]]),
+                    [0, -1, 0],
+                    [0, 0, 1]]),
         ]
         
         face_names = ['right', 'left', 'up', 'down', 'front', 'back']
         
         for i, (rot, name) in enumerate(zip(rotations, face_names)):
-            # Fisheye 카메라의 회전에 Cubemap 방향 회전 적용
             R_cubemap = self.R @ rot
             
-            # Dummy image (실제로는 렌더링될 예정)
             dummy_image = np.zeros((face_size, face_size, 3))
             
-            # Cubemap 카메라 생성
             cam = Camera(
-                colmap_id=self.colmap_id * 10 + i,  # Unique ID
+                colmap_id=self.colmap_id * 10 + i,
                 R=R_cubemap,
                 T=self.T,
                 FoVx=fov,

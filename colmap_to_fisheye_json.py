@@ -14,7 +14,7 @@ from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, 
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text
 
 
-def colmap_to_fisheye_json(colmap_path, images_folder, output_json="fisheye_cameras.json", fov=180.0):
+def colmap_to_fisheye_json(colmap_path, images_folder, output_json="fisheye_cameras.json", fov=117.0):
     """
     COLMAP 데이터를 fisheye_cameras.json으로 변환
     
@@ -110,7 +110,7 @@ if __name__ == "__main__":
                         help="Path to images folder (e.g., data/images)")
     parser.add_argument("--output", "-o", type=str, default="fisheye_cameras.json",
                         help="Output JSON filename")
-    parser.add_argument("--fov", type=float, default=180.0,
+    parser.add_argument("--fov", type=float, default=117.0,
                         help="Fisheye FOV in degrees (default: 180)")
     
     args = parser.parse_args()

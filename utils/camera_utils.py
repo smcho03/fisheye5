@@ -160,7 +160,7 @@ def camera_to_JSON(id, camera):
             'height': height,
             'position': pos.tolist(),
             'rotation': serializable_array_2d,
-            'fov': camera.FovY if hasattr(camera, 'FovY') else 180.0,
+            'fov': camera.FovY if hasattr(camera, 'FovY') else 117.0,
             'is_fisheye': True
         }
     else:
