@@ -77,7 +77,7 @@ class Camera(nn.Module):
             self.depth_image = torch.from_numpy(depth_image).to(self.data_device)
         else:
             self.depth_image = None
-
+        print(f"Created FisheyeCamera {self.uid}, memory footprint check")
 
 class FisheyeCamera(nn.Module):
     """
@@ -163,7 +163,7 @@ class FisheyeCamera(nn.Module):
         
         # Cubemap face size (정사각형)
         # Fisheye 이미지 크기를 기반으로 적절한 크기 설정
-        face_size = 1024
+        face_size = 1700
         
         # 90도 FOV (cubemap은 각 face가 90도)
         fov = math.pi / 2.0  # 90 degrees in radians

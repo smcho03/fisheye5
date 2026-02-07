@@ -94,6 +94,9 @@ class Scene:
             print(f"DEBUG: scene_info.train_cameras length: {len(scene_info.train_cameras) if hasattr(scene_info.train_cameras, '__len__') else 'N/A'}")
 
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
+            
+        
+        
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
