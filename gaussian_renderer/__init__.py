@@ -21,17 +21,13 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
            scaling_modifier=1.0, override_color=None, return_depth=False, return_opacity=False):
     """
     Render the scene (standard pinhole camera).
-    
-    Background tensor (bg_color) must be on GPU!
     """
-    # Create zero tensor for screen-space point gradients
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
     except:
         pass
 
-    # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
@@ -108,27 +104,7 @@ def render_fisheye(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Te
     """
     Fisheye 카메라 렌더링 (Cubemap → Fisheye, fully differentiable)
     
-    1. 6개 cubemap face를 각각 pinhole render로 렌더링
-    2. F.grid_sample 기반으로 fisheye 이미지로 변환
-    3. 모든 face의 visibility/radii/viewspace_points를 통합
-    
-    gradient flow: loss → fisheye_image → grid_sample → cubemap_faces → rasterizer → Gaussians
-    
-    Args:
-        viewpoint_camera: FisheyeCamera instance
-        pc: GaussianModel
-        pipe: Pipeline parameters
-        bg_color: Background color tensor (on GPU)
-        scaling_modifier: Scaling modifier
-        override_color: Override color
-        mapping_cache: Pre-computed cubemap→fisheye mapping cache
-        
-    Returns:
-        dict with:
-            "render": fisheye image [C, H, W] (differentiable)
-            "viewspace_points_list": list of 6 viewspace point tensors (for densification)
-            "visibility_filter": combined visibility across all faces
-            "radii": combined radii across all faces
+    mapping_cache가 OPENCV_FISHEYE distortion model을 포함할 수 있음
     """
     from scene.cameras import FisheyeCamera
     
@@ -146,8 +122,8 @@ def render_fisheye(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Te
     for i, cam in enumerate(cubemap_cameras):
         result = render(cam, pc, pipe, bg_color, scaling_modifier, override_color)
         
-        cubemap_faces.append(result["render"])  # [C, face_H, face_W] - has grad
-        all_viewspace_points.append(result["viewspace_points"])  # for densification
+        cubemap_faces.append(result["render"])
+        all_viewspace_points.append(result["viewspace_points"])
         all_visibility_filters.append(result["visibility_filter"])
         all_radii.append(result["radii"])
     
@@ -161,20 +137,18 @@ def render_fisheye(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Te
     )
     
     # 3. Visibility와 radii 통합
-    # 하나라도 visible이면 True
     combined_visibility = all_visibility_filters[0]
     for vis in all_visibility_filters[1:]:
         combined_visibility = combined_visibility | vis
     
-    # Radii는 최댓값 사용
     combined_radii = all_radii[0]
     for rad in all_radii[1:]:
         combined_radii = torch.maximum(combined_radii, rad)
     
     return {
         "render": fisheye_image,
-        "viewspace_points_list": all_viewspace_points,  # 6개 face의 viewspace points
+        "viewspace_points_list": all_viewspace_points,
         "visibility_filter": combined_visibility,
         "radii": combined_radii,
-        "cubemap_faces": cubemap_faces,  # 디버깅용
+        "cubemap_faces": cubemap_faces,
     }

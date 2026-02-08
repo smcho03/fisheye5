@@ -51,7 +51,6 @@ class SceneInfo(NamedTuple):
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
-        # 추가: 빈 리스트 체크
         if len(cam_centers) == 0:
             print("Warning: No cameras found!")
             return np.array([0., 0., 0.]), 1.0
@@ -70,7 +69,6 @@ def getNerfppNorm(cam_info):
         C2W = np.linalg.inv(W2C)
         cam_centers.append(C2W[:3, 3:4])
     
-    # 추가: 빈 리스트 체크
     if len(cam_centers) == 0:
         print("Warning: No camera centers collected!")
         return {"translate": np.array([0., 0., 0.]), "radius": 1.0}
@@ -140,24 +138,8 @@ def readFisheyeCameras(fisheye_json_path, images_folder, depths_folder=None):
     """
     Fisheye 카메라 정보를 JSON 파일에서 읽기
     
-    JSON 포맷 예시:
-    {
-        "cameras": [
-            {
-                "image_name": "image_001.jpg",
-                "R": [[...], [...], [...]],  # 3x3 rotation matrix
-                "T": [x, y, z],  # translation vector
-                "fov": 180.0,  # field of view in degrees
-                "width": 1024,
-                "height": 1024,
-                "fisheye_params": {
-                    "distortion_model": "equidistant",
-                    "k1": 0.0, "k2": 0.0, "k3": 0.0, "k4": 0.0  # optional distortion params
-                }
-            },
-            ...
-        ]
-    }
+    fisheye_params에 OPENCV_FISHEYE 파라미터(fx, fy, cx, cy, k1-k4)가 있으면
+    정확한 distortion model을 사용함
     """
     cam_infos = []
     
@@ -174,7 +156,7 @@ def readFisheyeCameras(fisheye_json_path, images_folder, depths_folder=None):
         image_name = cam_data["image_name"]
         R = np.array(cam_data["R"])
         T = np.array(cam_data["T"])
-        fov = cam_data.get("fov", 117.0)
+        fov = cam_data.get("fov", 190.0)  # Changed default: 117 → 190
         width = cam_data["width"]
         height = cam_data["height"]
         fisheye_params = cam_data.get("fisheye_params", {})
@@ -202,12 +184,11 @@ def readFisheyeCameras(fisheye_json_path, images_folder, depths_folder=None):
                         img_name_no_ext = os.path.splitext(image_name)[0]
                         depth_params = all_depth_params.get(img_name_no_ext, {})
         
-        # Fisheye는 FovX, FovY 대신 fov 하나만 사용
         cam_info = CameraInfo(
             uid=idx,
             R=R,
             T=T,
-            FovY=np.deg2rad(fov),  # Convert to radians
+            FovY=np.deg2rad(fov),
             FovX=np.deg2rad(fov),
             image=image,
             image_path=image_path,
@@ -235,7 +216,6 @@ def fetchPly(path):
 
 
 def storePly(path, xyz, rgb):
-    # Define the dtype for the structured array
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
             ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
@@ -246,7 +226,6 @@ def storePly(path, xyz, rgb):
     attributes = np.concatenate((xyz, normals, rgb), axis=1)
     elements[:] = list(map(tuple, attributes))
 
-    # Create the PlyData object and write to file
     vertex_element = PlyElement.describe(elements, 'vertex')
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
@@ -310,13 +289,6 @@ def readColmapSceneInfo(path, images, eval, depths=None, llffhold=8):
 def readFisheyeSceneInfo(path, images, eval, fisheye_json="fisheye_cameras.json", depths=None, llffhold=8):
     """
     Fisheye 데이터셋 읽기
-    
-    디렉토리 구조:
-    path/
-    ├── fisheye_cameras.json  # Fisheye 카메라 정보
-    ├── images/               # Fisheye 이미지들
-    ├── depths/               # (Optional) Depth 이미지들
-    └── sparse/0/             # COLMAP SfM 결과 (초기 point cloud용)
     """
     reading_dir = "images" if images == None else images
     images_folder = os.path.join(path, reading_dir)
@@ -325,7 +297,6 @@ def readFisheyeSceneInfo(path, images, eval, fisheye_json="fisheye_cameras.json"
     if depths is not None:
         depths_folder = os.path.join(path, depths)
     
-    # Fisheye 카메라 정보 읽기
     fisheye_json_path = os.path.join(path, fisheye_json)
     if not os.path.exists(fisheye_json_path):
         raise FileNotFoundError(f"Fisheye camera info not found: {fisheye_json_path}")
@@ -341,7 +312,6 @@ def readFisheyeSceneInfo(path, images, eval, fisheye_json="fisheye_cameras.json"
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    # Point cloud는 COLMAP 결과 사용 (또는 별도 제공)
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
@@ -354,7 +324,6 @@ def readFisheyeSceneInfo(path, images, eval, fisheye_json="fisheye_cameras.json"
             try:
                 xyz, rgb, _ = read_points3D_text(txt_path)
             except:
-                # Fallback: random point cloud
                 print("Warning: No point cloud found, using random initialization")
                 xyz = np.random.random((100, 3)) * 10 - 5
                 rgb = np.random.random((100, 3))
@@ -387,11 +356,9 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
 
     ply_path = os.path.join(path, "points3d.ply")
     if not os.path.exists(ply_path):
-        # Since this data set has no colmap data, we start with random points
         num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")
         
-        # We create random points inside the bounds of the synthetic Blender scenes
         xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
         shs = np.random.random((num_pts, 3)) / 255.0
         pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
@@ -452,5 +419,5 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
-    "Fisheye": readFisheyeSceneInfo  # 새로 추가!
+    "Fisheye": readFisheyeSceneInfo
 }

@@ -32,34 +32,52 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
+def get_fisheye_cache_key(cam):
+    """Fisheye 매핑 캐시 키 생성 (해상도 + FOV + distortion model)"""
+    params = cam.fisheye_params if hasattr(cam, 'fisheye_params') and cam.fisheye_params else {}
+    model = params.get("distortion_model", "equidistant")
+    if model == "opencv_fisheye":
+        # OPENCV_FISHEYE: 카메라 파라미터별 고유 키
+        return f"{cam.image_height}_{cam.image_width}_{model}_{params.get('fx',0):.2f}_{params.get('fy',0):.2f}"
+    else:
+        return f"{cam.image_height}_{cam.image_width}_{cam.fov}"
+
+
+def get_or_create_fisheye_cache(cam, cache_dict, device='cuda'):
+    """캐시에서 매핑을 가져오거나 새로 생성"""
+    cache_key = get_fisheye_cache_key(cam)
+    if cache_key not in cache_dict:
+        fisheye_params = cam.fisheye_params if hasattr(cam, 'fisheye_params') and cam.fisheye_params else None
+        cache_dict[cache_key] = create_mapping_cache(
+            cam.image_height,
+            cam.image_width,
+            fov=cam.fov,
+            device=device,
+            fisheye_params=fisheye_params
+        )
+    return cache_dict[cache_key], cache_key
+
+
 def add_fisheye_densification_stats(gaussians, viewspace_points_list, visibility_filter):
     """
     Fisheye 렌더링에서 6개 cubemap face의 viewspace gradient를 통합하여 densification stats에 추가
-    
-    각 face에서 관측된 gradient를 합산하고, 관측 횟수로 나누어 평균 gradient를 사용
     """
     n_points = gaussians.get_xyz.shape[0]
     
-    # 모든 face의 gradient를 합산
     combined_grad = torch.zeros(n_points, 2, device="cuda")
     combined_count = torch.zeros(n_points, 1, device="cuda")
     
     for viewspace_points in viewspace_points_list:
         if viewspace_points.grad is not None:
-            grad = viewspace_points.grad[:, :2]  # xy gradient만
-            # 유효한 gradient가 있는 점만
+            grad = viewspace_points.grad[:, :2]
             valid = (grad.abs().sum(dim=-1) > 0)
             if valid.any():
                 combined_grad[valid] += grad[valid]
                 combined_count[valid] += 1
     
-    # 관측된 점에 대해 평균 gradient 계산
     observed = (combined_count > 0).squeeze()
     if observed.any():
-        # gradient norm 계산 (합산된 gradient 사용)
         grad_norm = torch.norm(combined_grad[observed], dim=-1, keepdim=True)
-        
-        # densification stats에 추가
         gaussians.xyz_gradient_accum[observed] += grad_norm
         gaussians.denom[observed] += 1
 
@@ -86,7 +104,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     
-    # Fisheye 매핑 캐시 생성 (한 번만 계산)
+    # Fisheye 매핑 캐시 (한 번만 계산)
     fisheye_mapping_cache = {}
     
     for iteration in range(first_iter, opt.iterations + 1):
@@ -110,7 +128,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
@@ -131,19 +148,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         is_fisheye = isinstance(viewpoint_cam, FisheyeCamera)
         
         if is_fisheye:
-            # Fisheye: cubemap → fisheye (differentiable)
-            cache_key = f"{viewpoint_cam.image_height}_{viewpoint_cam.image_width}_{viewpoint_cam.fov}"
-            if cache_key not in fisheye_mapping_cache:
-                fisheye_mapping_cache[cache_key] = create_mapping_cache(
-                    viewpoint_cam.image_height,
-                    viewpoint_cam.image_width,
-                    fov=viewpoint_cam.fov,
-                    device='cuda'
-                )
+            cache, cache_key = get_or_create_fisheye_cache(viewpoint_cam, fisheye_mapping_cache)
             
             render_pkg = render_fisheye(
                 viewpoint_cam, gaussians, pipe, bg,
-                mapping_cache=fisheye_mapping_cache[cache_key]
+                mapping_cache=cache
             )
             
             image = render_pkg["render"]
@@ -152,7 +161,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             viewspace_points_list = render_pkg["viewspace_points_list"]
             
         else:
-            # Pinhole: 일반 렌더링
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
             
             image = render_pkg["render"]
@@ -172,18 +180,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         
         # Fisheye: valid mask로 원 바깥 영역 제외
         if is_fisheye:
-            cache_key = f"{viewpoint_cam.image_height}_{viewpoint_cam.image_width}_{viewpoint_cam.fov}"
-            valid_mask = fisheye_mapping_cache[cache_key]['valid_mask']  # [H, W] bool
+            valid_mask = cache['valid_mask']  # [H, W] bool
             valid_mask_3d = valid_mask.unsqueeze(0).float()  # [1, H, W]
             
-            # valid 영역만 loss 계산
             n_valid = valid_mask.sum().clamp(min=1)
             
             # L1 loss (masked)
             Ll1 = ((image - gt_image).abs() * valid_mask_3d).sum() / (n_valid * 3)
             
-            # SSIM loss (masked) - SSIM은 패치 기반이라 마스킹이 까다로움
-            # valid 영역 외부를 동일하게 만들어서 SSIM 왜곡 방지
+            # SSIM loss (masked)
             image_masked = image * valid_mask_3d
             gt_masked = gt_image * valid_mask_3d
             ssim_val = ssim(image_masked, gt_masked)
@@ -212,10 +217,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                 debug_base = os.path.join(dataset.model_path, "debug_fixed_view")
                 os.makedirs(debug_base, exist_ok=True)
                 
-                # 고정된 첫 번째 카메라로 렌더링
                 if 'debug_fixed_cam' not in dir():
                     all_cams = scene.getTrainCameras()
-                    # Fisheye 카메라 중 첫 번째를 고정 뷰로 선택
                     debug_fixed_cam = None
                     for c in all_cams:
                         if isinstance(c, FisheyeCamera):
@@ -227,17 +230,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                 if debug_fixed_cam is not None:
                     with torch.no_grad():
                         if isinstance(debug_fixed_cam, FisheyeCamera):
-                            cache_key = f"{debug_fixed_cam.image_height}_{debug_fixed_cam.image_width}_{debug_fixed_cam.fov}"
-                            if cache_key not in fisheye_mapping_cache:
-                                fisheye_mapping_cache[cache_key] = create_mapping_cache(
-                                    debug_fixed_cam.image_height,
-                                    debug_fixed_cam.image_width,
-                                    fov=debug_fixed_cam.fov,
-                                    device='cuda'
-                                )
+                            debug_cache, _ = get_or_create_fisheye_cache(debug_fixed_cam, fisheye_mapping_cache)
                             debug_pkg = render_fisheye(
                                 debug_fixed_cam, gaussians, pipe, background,
-                                mapping_cache=fisheye_mapping_cache[cache_key]
+                                mapping_cache=debug_cache
                             )
                         else:
                             debug_pkg = render(debug_fixed_cam, gaussians, pipe, background)
@@ -248,7 +244,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                         comparison_path = os.path.join(debug_base, f"iter_{iteration:06d}.png")
                         save_fisheye_comparison(debug_image, debug_gt, comparison_path)
                         
-                        # 첫 번째 iteration에서만 cubemap faces도 저장
                         if iteration <= 1000 and isinstance(debug_fixed_cam, FisheyeCamera):
                             if "cubemap_faces" in debug_pkg:
                                 cubemap_dir = os.path.join(debug_base, f"cubemap_iter_{iteration:06d}")
@@ -281,29 +276,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             # Densification
             # ============================================================
             if iteration < opt.densify_until_iter:
-                # max_radii2D 업데이트
                 gaussians.max_radii2D[visibility_filter] = torch.max(
                     gaussians.max_radii2D[visibility_filter], 
                     radii[visibility_filter]
                 )
                 
-                # Densification stats 추가
                 if is_fisheye:
-                    # Fisheye: 6개 face의 viewspace gradient를 통합
                     add_fisheye_densification_stats(
                         gaussians, viewspace_points_list, visibility_filter
                     )
                 else:
-                    # Pinhole: 기존 방식
                     gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     
-                    # Fisheye는 6개 face에서 gradient가 누적되므로 threshold를 높임
                     grad_threshold = opt.densify_grad_threshold
                     if is_fisheye:
-                        grad_threshold = opt.densify_grad_threshold * 3.0  # 경험적 보정 계수
+                        grad_threshold = opt.densify_grad_threshold * 3.0
                     
                     gaussians.densify_and_prune(grad_threshold, 0.005, 
                                                 scene.cameras_extent, size_threshold, radii)
@@ -317,7 +307,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 
-                # Exposure optimizer
                 if viewpoint_cam.exposure is not None:
                     gaussians.exposure_optimizer.step()
                     gaussians.exposure_optimizer.zero_grad(set_to_none=True)
@@ -372,17 +361,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
                     cam_is_fisheye = isinstance(viewpoint, FisheyeCamera)
                     
                     if cam_is_fisheye:
-                        cache_key = f"{viewpoint.image_height}_{viewpoint.image_width}_{viewpoint.fov}"
-                        if fisheye_cache is None or cache_key not in fisheye_cache:
-                            cache = create_mapping_cache(
-                                viewpoint.image_height,
-                                viewpoint.image_width,
-                                fov=viewpoint.fov,
-                                device='cuda'
-                            )
-                        else:
-                            cache = fisheye_cache[cache_key]
-                        
+                        cache, _ = get_or_create_fisheye_cache(viewpoint, fisheye_cache if fisheye_cache else {})
                         image = render_fisheye(viewpoint, scene.gaussians, *renderArgs, mapping_cache=cache)["render"]
                     else:
                         image = renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"]
@@ -400,16 +379,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
                     
                     # Fisheye: valid 영역만으로 metric 계산
                     if cam_is_fisheye:
-                        cache_key = f"{viewpoint.image_height}_{viewpoint.image_width}_{viewpoint.fov}"
-                        if fisheye_cache and cache_key in fisheye_cache:
-                            valid_mask = fisheye_cache[cache_key]['valid_mask']
-                        else:
-                            valid_mask = cache['valid_mask']
+                        valid_mask = cache['valid_mask']
                         valid_mask_3d = valid_mask.unsqueeze(0).float()
                         n_valid = valid_mask.sum().clamp(min=1)
                         
                         l1_val = ((image - gt_image).abs() * valid_mask_3d).sum() / (n_valid * 3)
-                        # PSNR도 valid 영역만
                         mse = ((image - gt_image) ** 2 * valid_mask_3d).sum() / (n_valid * 3)
                         psnr_val = -10.0 * torch.log10(mse.clamp(min=1e-8))
                         

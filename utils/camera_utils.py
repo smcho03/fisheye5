@@ -1,6 +1,5 @@
 #
 # Fisheye Camera 지원 추가 함수들
-# 기존 camera_utils.py에 추가할 내용
 #
 import numpy as np
 from scene.cameras import Camera, FisheyeCamera
@@ -13,12 +12,9 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
 
     for id, c in enumerate(cam_infos):
-        # Check if fisheye camera
         if hasattr(c, 'is_fisheye') and c.is_fisheye:
-            # Create FisheyeCamera
             camera_list.append(loadFisheyeCam(args, id, c, resolution_scale))
         else:
-            # Create regular Camera
             camera_list.append(loadCam(args, id, c, resolution_scale))
 
     return camera_list
@@ -32,7 +28,7 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
-    else:  # should be a type that converts to float
+    else:
         if args.resolution == -1:
             if orig_w > 1600:
                 global WARNED
@@ -59,6 +55,7 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     depth_image = None
     if cam_info.depth_image is not None:
+        import cv2
         depth_image = cv2.resize(cam_info.depth_image, resolution, interpolation=cv2.INTER_NEAREST)
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
@@ -79,7 +76,7 @@ def loadFisheyeCam(args, id, cam_info, resolution_scale):
 
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
-    else:  # should be a type that converts to float
+    else:
         if args.resolution == -1:
             if orig_w > 1600:
                 global WARNED
@@ -106,17 +103,21 @@ def loadFisheyeCam(args, id, cam_info, resolution_scale):
 
     depth_image = None
     if cam_info.depth_image is not None:
+        import cv2
         depth_image = cv2.resize(cam_info.depth_image, resolution, interpolation=cv2.INTER_NEAREST)
 
     # FOV는 FovY 또는 FovX 중 하나를 사용 (fisheye는 동일)
     fov_degrees = np.rad2deg(cam_info.FovY)
+    
+    # fisheye_params를 cam_info에서 가져옴
+    fisheye_params = cam_info.fisheye_params if hasattr(cam_info, 'fisheye_params') and cam_info.fisheye_params else {}
     
     return FisheyeCamera(
         colmap_id=cam_info.uid, 
         R=cam_info.R, 
         T=cam_info.T, 
         fov=fov_degrees,
-        fisheye_params=cam_info.fisheye_params if hasattr(cam_info, 'fisheye_params') else {},
+        fisheye_params=fisheye_params,
         image=gt_image, 
         gt_alpha_mask=loaded_mask,
         image_name=cam_info.image_name, 
@@ -130,17 +131,13 @@ def loadFisheyeCam(args, id, cam_info, resolution_scale):
 
 
 def camera_to_JSON(id, camera):
-    # CameraInfo인지 Camera 객체인지 확인
     if hasattr(camera, 'image_width'):
-        # Camera 객체
         width = camera.image_width
         height = camera.image_height
     else:
-        # CameraInfo
         width = camera.width
         height = camera.height
     
-    # 나머지 코드도 수정
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = camera.R.transpose()
     Rt[:3, 3] = camera.T
@@ -151,7 +148,6 @@ def camera_to_JSON(id, camera):
     rot = W2C[:3, :3]
     serializable_array_2d = [x.tolist() for x in rot]
     
-    # Fisheye 체크
     if hasattr(camera, 'is_fisheye') and camera.is_fisheye:
         camera_dict = {
             'id': id,
@@ -160,11 +156,10 @@ def camera_to_JSON(id, camera):
             'height': height,
             'position': pos.tolist(),
             'rotation': serializable_array_2d,
-            'fov': camera.FovY if hasattr(camera, 'FovY') else 117.0,
+            'fov': camera.FovY if hasattr(camera, 'FovY') else 190.0,  # Changed: 117 → 190
             'is_fisheye': True
         }
     else:
-        # Pinhole
         fovY = camera.FovY if hasattr(camera, 'FovY') else 0.0
         fovX = camera.FovX if hasattr(camera, 'FovX') else 0.0
         camera_dict = {
@@ -196,14 +191,11 @@ def PILtoTorch(pil_image, resolution):
 
 
 def fov2focal(fov, pixels):
-    """FOV를 focal length로 변환"""
     return pixels / (2 * np.tan(fov / 2))
 
 
 def focal2fov(focal, pixels):
-    """Focal length를 FOV로 변환"""
     return 2*np.arctan(pixels/(2*focal))
 
 
-# Global warning flag
 WARNED = False

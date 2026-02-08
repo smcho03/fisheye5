@@ -42,10 +42,10 @@ class Scene:
         self.test_cameras = {}
 
         # Determine dataset type
-        if os.path.exists(os.path.join(args.source_path, "fisheye_cameras.json")):
+        if os.path.exists(os.path.join(args.source_path, "fisheye_cameras_real_117.json")):
             print("Detected Fisheye dataset")
             scene_info = sceneLoadTypeCallbacks["Fisheye"](args.source_path, args.images, args.eval, 
-                                                   fisheye_json="fisheye_cameras_small.json", 
+                                                   fisheye_json="fisheye_cameras_real_117.json", 
                                                    depths=args.depths)
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.depths)

@@ -141,7 +141,7 @@ def test_uv_map(device='cuda'):
     from utils.cubemap_to_fisheye import create_mapping_cache
     
     fisheye_size = 1024
-    fov = 117.0
+    fov =117.0
     
     cache = create_mapping_cache(fisheye_size, fisheye_size, fov=fov, device=device)
     
@@ -232,7 +232,7 @@ def create_expected_layout_image(fisheye_size=1024, device='cuda'):
     """
     import math
     
-    fov = 117.0
+    fov =117.0
     fov_rad = math.radians(fov)
     
     cx = fisheye_size / 2.0

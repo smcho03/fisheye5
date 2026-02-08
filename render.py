@@ -19,6 +19,27 @@ from gaussian_renderer import GaussianModel
 from utils.cubemap_to_fisheye import create_mapping_cache
 
 
+def get_or_create_fisheye_cache(cam, cache_dict, device='cuda'):
+    """캐시에서 매핑을 가져오거나 새로 생성"""
+    params = cam.fisheye_params if hasattr(cam, 'fisheye_params') and cam.fisheye_params else {}
+    model = params.get("distortion_model", "equidistant")
+    if model == "opencv_fisheye":
+        cache_key = f"{cam.image_height}_{cam.image_width}_{model}_{params.get('fx',0):.2f}_{params.get('fy',0):.2f}"
+    else:
+        cache_key = f"{cam.image_height}_{cam.image_width}_{cam.fov}"
+    
+    if cache_key not in cache_dict:
+        fisheye_params = params if model == "opencv_fisheye" else None
+        cache_dict[cache_key] = create_mapping_cache(
+            cam.image_height,
+            cam.image_width,
+            fov=cam.fov,
+            device=device,
+            fisheye_params=fisheye_params
+        )
+    return cache_dict[cache_key]
+
+
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, fisheye_cache=None):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -26,20 +47,16 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
 
+    if fisheye_cache is None:
+        fisheye_cache = {}
+
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         is_fisheye = isinstance(view, FisheyeCamera)
         
         if is_fisheye:
-            cache_key = f"{view.image_height}_{view.image_width}_{view.fov}"
-            if fisheye_cache is None:
-                fisheye_cache = {}
-            if cache_key not in fisheye_cache:
-                fisheye_cache[cache_key] = create_mapping_cache(
-                    view.image_height, view.image_width,
-                    fov=view.fov, device='cuda'
-                )
+            cache = get_or_create_fisheye_cache(view, fisheye_cache)
             rendering = render_fisheye(view, gaussians, pipeline, background, 
-                                       mapping_cache=fisheye_cache[cache_key])["render"]
+                                       mapping_cache=cache)["render"]
         else:
             rendering = render(view, gaussians, pipeline, background)["render"]
         
