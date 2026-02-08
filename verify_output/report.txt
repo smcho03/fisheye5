@@ -1,0 +1,45 @@
+Cubemap Mapping Verification Report
+==================================================
+
+Test 1: Expected Layout
+  중앙: +Z (Magenta)
+  오른쪽: +X (Red)
+  왼쪽: -X (Green)
+  위: -Y (Yellow, 카메라 좌표계)
+  아래: +Y (Blue, 카메라 좌표계)
+
+Test 2: Mapping Only (cubemap_to_fisheye)
+  Color legend:
+    Face 0: +X (Red)
+    Face 1: -X (Green)
+    Face 2: +Y (Blue)
+    Face 3: -Y (Yellow)
+    Face 4: +Z (Magenta)
+    Face 5: -Z (Cyan)
+  → 02_mapping_only.png과 01_expected_layout.png을 비교하세요
+  → 중앙이 Magenta(+Z)이면 매핑 정상
+
+Test 3: Face Index Map
+  Face pixel distribution:
+    Face 0 (+X):  66024 pixels ( 8.02%)
+    Face 1 (-X):  66025 pixels ( 8.02%)
+    Face 2 (+Y):  66060 pixels ( 8.02%)
+    Face 3 (-Y):  66061 pixels ( 8.02%)
+    Face 4 (+Z): 559301 pixels (67.92%)
+    Face 5 (-Z):      0 pixels ( 0.00%)
+
+Test 4: UV Map
+  R channel = U coordinate, G channel = V coordinate
+  → 각 face 내에서 부드러운 그래디언트가 보여야 정상
+
+Test 5: Camera Rotation Consistency
+  FisheyeCamera(R=I, T=0)의 cubemap face cameras:
+
+    Face 0 (+X ): look=[1. 0. 0.], expected=[1 0 0], cos_sim=1.000 ✓ MATCH
+    Face 1 (-X ): look=[-1. -0. -0.], expected=[-1  0  0], cos_sim=1.000 ✓ MATCH
+    Face 2 (+Y ): look=[0. 1. 0.], expected=[0 1 0], cos_sim=1.000 ✓ MATCH
+    Face 3 (-Y ): look=[-0. -1. -0.], expected=[ 0 -1  0], cos_sim=1.000 ✓ MATCH
+    Face 4 (+Z ): look=[0. 0. 1.], expected=[0 0 1], cos_sim=1.000 ✓ MATCH
+    Face 5 (-Z ): look=[-0. -0. -1.], expected=[ 0  0 -1], cos_sim=1.000 ✓ MATCH
+
+  ✓ 모든 face의 회전이 예상과 일치합니다!

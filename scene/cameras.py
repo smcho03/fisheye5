@@ -182,62 +182,70 @@ class FisheyeCamera(nn.Module):
         cubemap_cameras = []
         
         face_size = 1024
-        fov = math.pi / 2.0  # 정확히 90도
+        fov = math.radians(95.0)  # 90° + 5° overlap → face 경계 seam 감소
         
         # 각 cubemap face의 로컬 회전 행렬
         # 이 행렬들은 "identity camera (Z=front)"에서 각 방향을 바라보도록 회전시킴
         # 
-        # Convention: 각 face camera의 -Z축이 해당 방향을 가리킴
-        # (OpenGL convention: camera looks along -Z)
+        # Convention: 3DGS rasterizer는 cam +Z 방향을 렌더링함
+        # R의 col2 = 렌더 방향 (카메라가 보는 world 방향)
         #
         # R_face: 카메라 로컬 좌표계에서의 회전
         # 최종 cubemap camera의 R = self.R @ R_face
         
         face_rotations = []
         
-        # Face 0: +X (오른쪽을 바라봄)
-        # -Z_new = +X_orig → 카메라가 +X 방향을 바라봄
+        # 핵심: self.R은 cam2world rotation (열 = 카메라 축의 world 방향)
+        # 3DGS rasterizer는 cam +Z 방향의 물체를 렌더링함
+        # 따라서 col2 = "렌더 방향" (카메라가 보는 world 방향)
+        #
+        # UV 매핑은 OpenGL cubemap 규약을 따르므로,
+        # 각 face의 cam_x, cam_y를 매핑 공식과 일치하도록 설정
+        #
+        # col0 = cam_x (이미지 u 증가 방향)
+        # col1 = cam_y (이미지 v 증가 방향)  
+        # col2 = cam_z (렌더 방향, depth 양수 방향)
+        
+        # Face 0: +X (오른쪽 렌더)
         face_rotations.append(np.array([
-            [0, 0, 1],    # X_new = Z_orig
-            [0, 1, 0],    # Y_new = Y_orig (아래)
-            [-1, 0, 0],   # Z_new = -X_orig → -Z_new = +X_orig
+            [0, 0, 1],
+            [0, 1, 0],
+            [-1, 0, 0],
         ], dtype=np.float64))
         
-        # Face 1: -X (왼쪽을 바라봄)
+        # Face 1: -X (왼쪽 렌더)
         face_rotations.append(np.array([
-            [0, 0, -1],   # X_new = -Z_orig
-            [0, 1, 0],    # Y_new = Y_orig
-            [1, 0, 0],    # Z_new = X_orig → -Z_new = -X_orig
+            [0, 0, -1],
+            [0, 1, 0],
+            [1, 0, 0],
         ], dtype=np.float64))
         
-        # Face 2: +Y (위를 바라봄 - 카메라 좌표계에서 +Y는 아래이므로, 이건 "아래를 바라봄")
-        # 주의: cubemap에서 +Y는 "위"이지만, 카메라 좌표계에서 Y는 아래
-        # 여기서는 fisheye 매핑의 +Y 방향과 일치시킴
+        # Face 2: +Y (아래 렌더)
         face_rotations.append(np.array([
-            [1, 0, 0],    # X_new = X_orig
-            [0, 0, 1],    # Y_new = Z_orig
-            [0, -1, 0],   # Z_new = -Y_orig → -Z_new = +Y_orig
+            [1, 0, 0],
+            [0, 0, 1],
+            [0, -1, 0],
         ], dtype=np.float64))
         
-        # Face 3: -Y (위를 바라봄)
+        # Face 3: -Y (위 렌더)
         face_rotations.append(np.array([
-            [1, 0, 0],    # X_new = X_orig
-            [0, 0, -1],   # Y_new = -Z_orig
-            [0, 1, 0],    # Z_new = Y_orig → -Z_new = -Y_orig
+            [1, 0, 0],
+            [0, 0, -1],
+            [0, 1, 0],
         ], dtype=np.float64))
         
-        # Face 4: +Z (앞을 바라봄 - identity)
+        # Face 4: +Z (앞 렌더, identity)
         face_rotations.append(np.array([
             [1, 0, 0],
             [0, 1, 0],
             [0, 0, 1],
         ], dtype=np.float64))
         
-        # Face 5: -Z (뒤를 바라봄)
+        # Face 5: -Z (뒤 렌더)
         face_rotations.append(np.array([
-            [-1, 0, 0],   # X_new = -X_orig (좌우반전)
-            [0, 1, 0],    # Y_new = Y_orig
-            [0, 0, -1],   # Z_new = -Z_orig → -Z_new = +Z_orig (뒤)
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, 0, -1],
         ], dtype=np.float64))
         
         face_names = ['pos_x', 'neg_x', 'pos_y', 'neg_y', 'pos_z', 'neg_z']

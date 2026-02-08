@@ -170,10 +170,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             exposure = viewpoint_cam.exposure
             image = image * torch.exp(exposure[0]) + exposure[1:].unsqueeze(-1).unsqueeze(-1)
         
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        # Fisheye: valid mask로 원 바깥 영역 제외
+        if is_fisheye:
+            cache_key = f"{viewpoint_cam.image_height}_{viewpoint_cam.image_width}_{viewpoint_cam.fov}"
+            valid_mask = fisheye_mapping_cache[cache_key]['valid_mask']  # [H, W] bool
+            valid_mask_3d = valid_mask.unsqueeze(0).float()  # [1, H, W]
+            
+            # valid 영역만 loss 계산
+            n_valid = valid_mask.sum().clamp(min=1)
+            
+            # L1 loss (masked)
+            Ll1 = ((image - gt_image).abs() * valid_mask_3d).sum() / (n_valid * 3)
+            
+            # SSIM loss (masked) - SSIM은 패치 기반이라 마스킹이 까다로움
+            # valid 영역 외부를 동일하게 만들어서 SSIM 왜곡 방지
+            image_masked = image * valid_mask_3d
+            gt_masked = gt_image * valid_mask_3d
+            ssim_val = ssim(image_masked, gt_masked)
+            
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_val)
+        else:
+            Ll1 = l1_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
-        # Depth regularization (pinhole only - fisheye는 cubemap 단계에서는 미적용)
+        # Depth regularization (pinhole only)
         if not is_fisheye and hasattr(viewpoint_cam, 'depth_image') and viewpoint_cam.depth_image is not None:
             if "depth" in render_pkg:
                 depth_loss = l1_loss(render_pkg["depth"], viewpoint_cam.depth_image)
@@ -184,17 +204,59 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         iter_end.record()
 
         # ============================================================
-        # Debug 저장 (1000 iteration마다)
+        # Debug 저장 (1000 iteration마다, 고정된 뷰 사용)
         # ============================================================
-        if is_fisheye and iteration % 1000 == 0:
+        if iteration % 1000 == 0:
             try:
-                from utils.debug_fisheye import save_fisheye_comparison
-                debug_base = os.path.join(dataset.model_path, f"debug_iter_{iteration}")
+                from utils.debug_fisheye import save_fisheye_comparison, save_cubemap_debug
+                debug_base = os.path.join(dataset.model_path, "debug_fixed_view")
                 os.makedirs(debug_base, exist_ok=True)
-                comparison_path = os.path.join(debug_base, "fisheye_comparison.png")
-                save_fisheye_comparison(image.detach(), gt_image, comparison_path)
+                
+                # 고정된 첫 번째 카메라로 렌더링
+                if 'debug_fixed_cam' not in dir():
+                    all_cams = scene.getTrainCameras()
+                    # Fisheye 카메라 중 첫 번째를 고정 뷰로 선택
+                    debug_fixed_cam = None
+                    for c in all_cams:
+                        if isinstance(c, FisheyeCamera):
+                            debug_fixed_cam = c
+                            break
+                    if debug_fixed_cam is None and len(all_cams) > 0:
+                        debug_fixed_cam = all_cams[0]
+                
+                if debug_fixed_cam is not None:
+                    with torch.no_grad():
+                        if isinstance(debug_fixed_cam, FisheyeCamera):
+                            cache_key = f"{debug_fixed_cam.image_height}_{debug_fixed_cam.image_width}_{debug_fixed_cam.fov}"
+                            if cache_key not in fisheye_mapping_cache:
+                                fisheye_mapping_cache[cache_key] = create_mapping_cache(
+                                    debug_fixed_cam.image_height,
+                                    debug_fixed_cam.image_width,
+                                    fov=debug_fixed_cam.fov,
+                                    device='cuda'
+                                )
+                            debug_pkg = render_fisheye(
+                                debug_fixed_cam, gaussians, pipe, background,
+                                mapping_cache=fisheye_mapping_cache[cache_key]
+                            )
+                        else:
+                            debug_pkg = render(debug_fixed_cam, gaussians, pipe, background)
+                        
+                        debug_image = debug_pkg["render"]
+                        debug_gt = debug_fixed_cam.original_image.cuda()
+                        
+                        comparison_path = os.path.join(debug_base, f"iter_{iteration:06d}.png")
+                        save_fisheye_comparison(debug_image, debug_gt, comparison_path)
+                        
+                        # 첫 번째 iteration에서만 cubemap faces도 저장
+                        if iteration <= 1000 and isinstance(debug_fixed_cam, FisheyeCamera):
+                            if "cubemap_faces" in debug_pkg:
+                                cubemap_dir = os.path.join(debug_base, f"cubemap_iter_{iteration:06d}")
+                                save_cubemap_debug(debug_pkg["cubemap_faces"], cubemap_dir)
             except Exception as e:
                 print(f"Debug save failed: {e}")
+                import traceback
+                traceback.print_exc()
 
         with torch.no_grad():
             # Progress bar
@@ -237,7 +299,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, 
+                    
+                    # Fisheye는 6개 face에서 gradient가 누적되므로 threshold를 높임
+                    grad_threshold = opt.densify_grad_threshold
+                    if is_fisheye:
+                        grad_threshold = opt.densify_grad_threshold * 3.0  # 경험적 보정 계수
+                    
+                    gaussians.densify_and_prune(grad_threshold, 0.005, 
                                                 scene.cameras_extent, size_threshold, radii)
                 
                 if iteration % opt.opacity_reset_interval == 0 or \
@@ -330,8 +398,26 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    # Fisheye: valid 영역만으로 metric 계산
+                    if cam_is_fisheye:
+                        cache_key = f"{viewpoint.image_height}_{viewpoint.image_width}_{viewpoint.fov}"
+                        if fisheye_cache and cache_key in fisheye_cache:
+                            valid_mask = fisheye_cache[cache_key]['valid_mask']
+                        else:
+                            valid_mask = cache['valid_mask']
+                        valid_mask_3d = valid_mask.unsqueeze(0).float()
+                        n_valid = valid_mask.sum().clamp(min=1)
+                        
+                        l1_val = ((image - gt_image).abs() * valid_mask_3d).sum() / (n_valid * 3)
+                        # PSNR도 valid 영역만
+                        mse = ((image - gt_image) ** 2 * valid_mask_3d).sum() / (n_valid * 3)
+                        psnr_val = -10.0 * torch.log10(mse.clamp(min=1e-8))
+                        
+                        l1_test += l1_val.mean().double()
+                        psnr_test += psnr_val.mean().double()
+                    else:
+                        l1_test += l1_loss(image, gt_image).mean().double()
+                        psnr_test += psnr(image, gt_image).mean().double()
                 
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
