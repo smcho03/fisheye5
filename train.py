@@ -14,7 +14,7 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, render_fisheye_optimized, network_gui
+from gaussian_renderer import render, render_fisheye, network_gui
 import sys
 from scene import Scene, GaussianModel
 from scene.cameras import FisheyeCamera
@@ -24,6 +24,7 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.cubemap_to_fisheye import create_mapping_cache
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -31,7 +32,40 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def add_fisheye_densification_stats(gaussians, viewspace_points_list, visibility_filter):
+    """
+    Fisheye 렌더링에서 6개 cubemap face의 viewspace gradient를 통합하여 densification stats에 추가
+    
+    각 face에서 관측된 gradient를 합산하고, 관측 횟수로 나누어 평균 gradient를 사용
+    """
+    n_points = gaussians.get_xyz.shape[0]
+    
+    # 모든 face의 gradient를 합산
+    combined_grad = torch.zeros(n_points, 2, device="cuda")
+    combined_count = torch.zeros(n_points, 1, device="cuda")
+    
+    for viewspace_points in viewspace_points_list:
+        if viewspace_points.grad is not None:
+            grad = viewspace_points.grad[:, :2]  # xy gradient만
+            # 유효한 gradient가 있는 점만
+            valid = (grad.abs().sum(dim=-1) > 0)
+            if valid.any():
+                combined_grad[valid] += grad[valid]
+                combined_count[valid] += 1
+    
+    # 관측된 점에 대해 평균 gradient 계산
+    observed = (combined_count > 0).squeeze()
+    if observed.any():
+        # gradient norm 계산 (합산된 gradient 사용)
+        grad_norm = torch.norm(combined_grad[observed], dim=-1, keepdim=True)
+        
+        # densification stats에 추가
+        gaussians.xyz_gradient_accum[observed] += grad_norm
+        gaussians.denom[observed] += 1
+
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, 
+             checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -44,8 +78,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -55,7 +89,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Fisheye 매핑 캐시 생성 (한 번만 계산)
     fisheye_mapping_cache = {}
     
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
+        # Network GUI
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -90,12 +125,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        # Fisheye 카메라인지 확인
+        # ============================================================
+        # Fisheye vs Pinhole 렌더링
+        # ============================================================
         is_fisheye = isinstance(viewpoint_cam, FisheyeCamera)
         
         if is_fisheye:
-            # Fisheye 렌더링
-            # 매핑 캐시가 없으면 생성
+            # Fisheye: cubemap → fisheye (differentiable)
             cache_key = f"{viewpoint_cam.image_height}_{viewpoint_cam.image_width}_{viewpoint_cam.fov}"
             if cache_key not in fisheye_mapping_cache:
                 fisheye_mapping_cache[cache_key] = create_mapping_cache(
@@ -105,20 +141,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     device='cuda'
                 )
             
-            render_pkg = render_fisheye_optimized(
+            render_pkg = render_fisheye(
                 viewpoint_cam, gaussians, pipe, bg,
                 mapping_cache=fisheye_mapping_cache[cache_key]
             )
+            
+            image = render_pkg["render"]
+            visibility_filter = render_pkg["visibility_filter"]
+            radii = render_pkg["radii"]
+            viewspace_points_list = render_pkg["viewspace_points_list"]
+            
         else:
-            # 일반 Pinhole 렌더링
+            # Pinhole: 일반 렌더링
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            
+            image = render_pkg["render"]
+            visibility_filter = render_pkg["visibility_filter"]
+            radii = render_pkg["radii"]
+            viewspace_point_tensor = render_pkg["viewspace_points"]
 
-        # Loss
+        # ============================================================
+        # Loss 계산
+        # ============================================================
         gt_image = viewpoint_cam.original_image.cuda()
         
-        # Exposure compensation (if enabled)
+        # Exposure compensation
         if viewpoint_cam.exposure is not None:
             exposure = viewpoint_cam.exposure
             image = image * torch.exp(exposure[0]) + exposure[1:].unsqueeze(-1).unsqueeze(-1)
@@ -126,47 +173,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
-        # Depth regularization (if available)
-        if hasattr(viewpoint_cam, 'depth_image') and viewpoint_cam.depth_image is not None and not is_fisheye:
-            # Depth loss는 pinhole 카메라에서만 적용 (fisheye는 cubemap 단계에서 처리 필요)
+        # Depth regularization (pinhole only - fisheye는 cubemap 단계에서는 미적용)
+        if not is_fisheye and hasattr(viewpoint_cam, 'depth_image') and viewpoint_cam.depth_image is not None:
             if "depth" in render_pkg:
                 depth_loss = l1_loss(render_pkg["depth"], viewpoint_cam.depth_image)
                 loss = loss + 0.1 * depth_loss
         
-        # iteration 100에 추가
-        # 여러 iteration에서 저장
-        if iteration % 1000==0:
-            from utils.debug_fisheye import save_cubemap_debug, visualize_mapping, save_fisheye_comparison
-            import os
-            
-            if is_fisheye:
-                debug_base = os.path.join(dataset.model_path, f"debug_iter_{iteration}")
-                os.makedirs(debug_base, exist_ok=True)
-                
-                '''
-                cubemap_faces = render_pkg.get("cubemap_faces")
-                if cubemap_faces is not None:
-                    output_dir = os.path.join(debug_base, "cubemap")
-                    save_cubemap_debug(cubemap_faces, output_dir)
-                
-                if cache_key in fisheye_mapping_cache:
-                    cache = fisheye_mapping_cache[cache_key]
-                    viz_path = os.path.join(debug_base, "mapping_viz.png")
-                    visualize_mapping(
-                        cache['face_idx'],
-                        viewpoint_cam.image_height,
-                        viewpoint_cam.image_width,
-                        viz_path
-                    )
-                '''
-                    
-                
-                comparison_path = os.path.join(debug_base, "fisheye_comparison.png")
-                save_fisheye_comparison(image, gt_image, comparison_path)
-                
         loss.backward()
 
         iter_end.record()
+
+        # ============================================================
+        # Debug 저장 (1000 iteration마다)
+        # ============================================================
+        if is_fisheye and iteration % 1000 == 0:
+            try:
+                from utils.debug_fisheye import save_fisheye_comparison
+                debug_base = os.path.join(dataset.model_path, f"debug_iter_{iteration}")
+                os.makedirs(debug_base, exist_ok=True)
+                comparison_path = os.path.join(debug_base, "fisheye_comparison.png")
+                save_fisheye_comparison(image.detach(), gt_image, comparison_path)
+            except Exception as e:
+                print(f"Debug save failed: {e}")
 
         with torch.no_grad():
             # Progress bar
@@ -178,49 +206,73 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), is_fisheye, fisheye_mapping_cache)
-            if (iteration in saving_iterations):
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, 
+                          iter_start.elapsed_time(iter_end), testing_iterations, 
+                          scene, render, (pipe, background),
+                          fisheye_cache=fisheye_mapping_cache)
+            
+            if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            # ============================================================
             # Densification
+            # ============================================================
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # max_radii2D 업데이트
+                gaussians.max_radii2D[visibility_filter] = torch.max(
+                    gaussians.max_radii2D[visibility_filter], 
+                    radii[visibility_filter]
+                )
+                
+                # Densification stats 추가
+                if is_fisheye:
+                    # Fisheye: 6개 face의 viewspace gradient를 통합
+                    add_fisheye_densification_stats(
+                        gaussians, viewspace_points_list, visibility_filter
+                    )
+                else:
+                    # Pinhole: 기존 방식
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, 
+                                                scene.cameras_extent, size_threshold, radii)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                if iteration % opt.opacity_reset_interval == 0 or \
+                   (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
+                gaussians.optimizer.zero_grad(set_to_none=True)
+                
+                # Exposure optimizer
+                if viewpoint_cam.exposure is not None:
+                    gaussians.exposure_optimizer.step()
+                    gaussians.exposure_optimizer.zero_grad(set_to_none=True)
 
-            if (iteration in checkpoint_iterations):
+            if iteration in checkpoint_iterations:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                torch.save((gaussians.capture(), iteration), 
+                          scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
+            unique_str = os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
         
-    # Set up output folder
     print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
+    os.makedirs(args.model_path, exist_ok=True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
@@ -229,28 +281,29 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, is_fisheye=False, fisheye_cache=None):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, 
+                   testing_iterations, scene: Scene, renderFunc, renderArgs,
+                   fisheye_cache=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
-    # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        validation_configs = (
+            {'name': 'test', 'cameras': scene.getTestCameras()}, 
+            {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]}
+        )
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    # Check if fisheye camera
                     cam_is_fisheye = isinstance(viewpoint, FisheyeCamera)
                     
                     if cam_is_fisheye:
-                        # Fisheye rendering
                         cache_key = f"{viewpoint.image_height}_{viewpoint.image_width}_{viewpoint.fov}"
                         if fisheye_cache is None or cache_key not in fisheye_cache:
                             cache = create_mapping_cache(
@@ -262,14 +315,12 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         else:
                             cache = fisheye_cache[cache_key]
                         
-                        image = render_fisheye_optimized(viewpoint, scene.gaussians, *renderArgs, mapping_cache=cache)["render"]
+                        image = render_fisheye(viewpoint, scene.gaussians, *renderArgs, mapping_cache=cache)["render"]
                     else:
-                        # Pinhole rendering
                         image = renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"]
                     
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     
-                    # Exposure compensation
                     if viewpoint.exposure is not None:
                         exposure = viewpoint.exposure
                         image = image * torch.exp(exposure[0]) + exposure[1:].unsqueeze(-1).unsqueeze(-1)
@@ -278,8 +329,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
@@ -294,7 +347,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
 
 if __name__ == "__main__":
-    # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -307,19 +359,21 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--disable_viewer", action="store_true")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
 
-    # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    if not args.disable_viewer:
+        network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    
+    training(lp.extract(args), op.extract(args), pp.extract(args), 
+             args.test_iterations, args.save_iterations, 
+             args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
-    # All done
     print("\nTraining complete.")

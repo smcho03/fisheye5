@@ -9,7 +9,7 @@ from scene import Scene
 import os
 from tqdm import tqdm
 from os import makedirs
-from gaussian_renderer import render, render_fisheye_optimized
+from gaussian_renderer import render, render_fisheye
 from scene.cameras import FisheyeCamera
 import torchvision
 from utils.general_utils import safe_state
@@ -17,6 +17,7 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 from utils.cubemap_to_fisheye import create_mapping_cache
+
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, fisheye_cache=None):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -26,52 +27,48 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(gts_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        # Check if fisheye camera
         is_fisheye = isinstance(view, FisheyeCamera)
         
         if is_fisheye:
-            # Fisheye rendering
             cache_key = f"{view.image_height}_{view.image_width}_{view.fov}"
-            if fisheye_cache is None or cache_key not in fisheye_cache:
-                cache = create_mapping_cache(
-                    view.image_height,
-                    view.image_width,
-                    fov=view.fov,
-                    device='cuda'
+            if fisheye_cache is None:
+                fisheye_cache = {}
+            if cache_key not in fisheye_cache:
+                fisheye_cache[cache_key] = create_mapping_cache(
+                    view.image_height, view.image_width,
+                    fov=view.fov, device='cuda'
                 )
-                if fisheye_cache is not None:
-                    fisheye_cache[cache_key] = cache
-            else:
-                cache = fisheye_cache[cache_key]
-            
-            rendering = render_fisheye_optimized(view, gaussians, pipeline, background, mapping_cache=cache)["render"]
+            rendering = render_fisheye(view, gaussians, pipeline, background, 
+                                       mapping_cache=fisheye_cache[cache_key])["render"]
         else:
-            # Pinhole rendering
             rendering = render(view, gaussians, pipeline, background)["render"]
         
         gt = view.original_image[0:3, :, :]
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
+
+def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
+                skip_train: bool, skip_test: bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
 
-        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         
-        # Fisheye 매핑 캐시
         fisheye_cache = {}
 
         if not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, fisheye_cache)
+            render_set(dataset.model_path, "train", scene.loaded_iter, 
+                      scene.getTrainCameras(), gaussians, pipeline, background, fisheye_cache)
 
         if not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, fisheye_cache)
+            render_set(dataset.model_path, "test", scene.loaded_iter, 
+                      scene.getTestCameras(), gaussians, pipeline, background, fisheye_cache)
+
 
 if __name__ == "__main__":
-    # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
@@ -82,7 +79,6 @@ if __name__ == "__main__":
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
-    # Initialize system state (RNG)
     safe_state(args.quiet)
-
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), 
+                args.skip_train, args.skip_test)
