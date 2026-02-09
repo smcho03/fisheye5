@@ -42,10 +42,17 @@ class Scene:
         self.test_cameras = {}
 
         # Determine dataset type
-        if os.path.exists(os.path.join(args.source_path, "fisheye_cameras_real_117.json")):
-            print("Detected Fisheye dataset")
+        # Fisheye JSON 자동 탐색: fisheye_cameras.json 또는 fisheye_cameras_small.json
+        fisheye_json = None
+        for json_name in ["fisheye_cameras.json", "fisheye_cameras_small.json"]:
+            if os.path.exists(os.path.join(args.source_path, json_name)):
+                fisheye_json = json_name
+                break
+        
+        if fisheye_json is not None:
+            print(f"Detected Fisheye dataset: {fisheye_json}")
             scene_info = sceneLoadTypeCallbacks["Fisheye"](args.source_path, args.images, args.eval, 
-                                                   fisheye_json="fisheye_cameras_real_117.json", 
+                                                   fisheye_json=fisheye_json, 
                                                    depths=args.depths)
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.depths)
@@ -87,12 +94,6 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
         else:
-            # 91번째 줄 근처
-            print(f"DEBUG: scene_info.point_cloud type: {type(scene_info.point_cloud)}")
-            print(f"DEBUG: self.cameras_extent type: {type(self.cameras_extent)}")
-            print(f"DEBUG: scene_info.train_cameras type: {type(scene_info.train_cameras)}")
-            print(f"DEBUG: scene_info.train_cameras length: {len(scene_info.train_cameras) if hasattr(scene_info.train_cameras, '__len__') else 'N/A'}")
-
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
             
         

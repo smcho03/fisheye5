@@ -127,6 +127,8 @@ def opencv_fisheye_theta_d_to_theta(theta_d, k1, k2, k3, k4, max_iter=20):
         f_val = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8) - theta_d
         f_deriv = 1.0 + 3*k1*t2 + 5*k2*t4 + 7*k3*t6 + 9*k4*t8
         theta = theta - f_val / f_deriv.clamp(min=1e-8)
+        # Clamp to valid range [0, pi] to prevent divergence
+        theta = theta.clamp(min=0.0, max=math.pi)
     return theta
 
 
@@ -204,15 +206,32 @@ def create_fisheye_mapping(height, width, fov=190.0, device='cuda', fisheye_para
         theta_d = torch.sqrt(mx**2 + my**2)
         phi = torch.atan2(my, mx)
         
-        # Valid mask: theta_d가 의미있는 범위 내
-        # r_max_pixels 기반으로 계산
+        # Find the maximum theta where forward function is still monotonic
+        # (derivative > 0). Beyond this, inverse distortion is undefined.
+        theta_max_valid = math.pi
+        for deg10 in range(1, 1800):  # 0.1° to 180°
+            t = math.radians(deg10 / 10.0)
+            t2 = t * t
+            deriv = 1 + 3*k1*t2 + 5*k2*t2*t2 + 7*k3*t2*t2*t2 + 9*k4*t2*t2*t2*t2
+            if deriv <= 0:
+                theta_max_valid = math.radians((deg10 - 1) / 10.0)
+                break
+        
+        # Maximum achievable theta_d in the monotonic range
+        theta_d_at_max = theta_max_valid + k1*theta_max_valid**3 + k2*theta_max_valid**5 + k3*theta_max_valid**7 + k4*theta_max_valid**9
+        
+        # Valid mask: theta_d must be within the range where inverse is well-defined
+        # Also check pixel distance from principal point
         f_avg = (fx_s + fy_s) / 2.0
         r_max_pixels = min(cx_s, cy_s, width - cx_s, height - cy_s)
-        theta_d_max = r_max_pixels / f_avg
+        theta_d_max = min(r_max_pixels / f_avg, theta_d_at_max)
         valid_mask = theta_d <= theta_d_max
         
+        # Clamp theta_d to valid range before inverse (prevents Newton divergence)
+        theta_d_clamped = theta_d.clamp(max=theta_d_at_max)
+        
         # Inverse distortion: theta_d → theta (실제 각도)
-        theta = opencv_fisheye_theta_d_to_theta(theta_d, k1, k2, k3, k4)
+        theta = opencv_fisheye_theta_d_to_theta(theta_d_clamped, k1, k2, k3, k4)
         
         # theta가 유효한 범위인지 추가 체크
         valid_mask = valid_mask & (theta >= 0) & (theta < math.pi)

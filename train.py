@@ -244,7 +244,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                         comparison_path = os.path.join(debug_base, f"iter_{iteration:06d}.png")
                         save_fisheye_comparison(debug_image, debug_gt, comparison_path)
                         
-                        if iteration <= 1000 and isinstance(debug_fixed_cam, FisheyeCamera):
+                        if (iteration % 4000 == 0) and isinstance(debug_fixed_cam, FisheyeCamera):
                             if "cubemap_faces" in debug_pkg:
                                 cubemap_dir = os.path.join(debug_base, f"cubemap_iter_{iteration:06d}")
                                 save_cubemap_debug(debug_pkg["cubemap_faces"], cubemap_dir)

@@ -24,33 +24,56 @@ def compute_opencv_fisheye_fov(fx, fy, cx, cy, k1, k2, k3, k4, width, height):
         theta_d = theta + k1*theta^3 + k2*theta^5 + k3*theta^7 + k4*theta^9
         r_pixel = f * theta_d
     
-    r_max = 이미지 원의 반지름 (principal point에서 가장 가까운 edge까지)
-    theta_d_max = r_max / f
-    theta_max = solve(theta_d = theta_d_max) via Newton's method
-    FOV = 2 * theta_max
+    주의: 왜곡 계수에 따라 forward 함수가 비단조(non-monotonic)일 수 있음.
+    이 경우 derivative가 0이 되는 지점(theta_max_valid)까지만 유효.
+    FOV = min(2*theta_solved, 2*theta_max_valid)
     """
     f_avg = (fx + fy) / 2.0
     r_max = min(cx, cy, width - cx, height - cy)
-    theta_d_max = r_max / f_avg
+    theta_d_target = r_max / f_avg
     
-    # Newton's method to solve: theta + k1*t^3 + k2*t^5 + k3*t^7 + k4*t^9 = theta_d_max
-    theta = theta_d_max  # initial guess
-    for _ in range(50):
-        t3 = theta**3
-        t5 = theta**5
-        t7 = theta**7
-        t9 = theta**9
-        f_val = theta + k1*t3 + k2*t5 + k3*t7 + k4*t9 - theta_d_max
-        f_deriv = 1 + 3*k1*theta**2 + 5*k2*theta**4 + 7*k3*theta**6 + 9*k4*theta**8
-        if abs(f_deriv) < 1e-12:
+    def forward(theta):
+        return theta + k1*theta**3 + k2*theta**5 + k3*theta**7 + k4*theta**9
+    
+    def forward_deriv(theta):
+        return 1 + 3*k1*theta**2 + 5*k2*theta**4 + 7*k3*theta**6 + 9*k4*theta**8
+    
+    # Step 1: Find theta_max_valid where forward function is still monotonically increasing
+    # (derivative > 0). Search in 0.1° steps.
+    theta_max_valid = np.pi  # default
+    for deg10 in range(1, 1800):  # 0.1° to 180°
+        t = np.radians(deg10 / 10.0)
+        if forward_deriv(t) <= 0:
+            theta_max_valid = np.radians((deg10 - 1) / 10.0)
             break
-        theta = theta - f_val / f_deriv
+    
+    # Step 2: The max achievable theta_d in the valid range
+    theta_d_at_max = forward(theta_max_valid)
+    
+    # Step 3: If target theta_d exceeds what the model can produce,
+    # clamp to theta_max_valid (image edges beyond this are invalid anyway)
+    if theta_d_target > theta_d_at_max:
+        print(f"    Note: theta_d_target ({np.degrees(theta_d_target):.1f}°) > max valid theta_d ({np.degrees(theta_d_at_max):.1f}°)")
+        print(f"    Clamping FOV to valid range: {2*np.degrees(theta_max_valid):.1f}°")
+        theta = theta_max_valid
+    else:
+        # Step 4: Bisection search in [0, theta_max_valid] (guaranteed monotonic)
+        lo, hi = 0.0, theta_max_valid
+        for _ in range(200):
+            mid = (lo + hi) / 2.0
+            if forward(mid) < theta_d_target:
+                lo = mid
+            else:
+                hi = mid
+            if hi - lo < 1e-12:
+                break
+        theta = (lo + hi) / 2.0
     
     fov_full = 2.0 * np.degrees(theta)
     return fov_full
 
 
-def colmap_to_fisheye_json(colmap_path, images_folder, output_json="fisheye_cameras.json", fov_override=None):
+def colmap_to_fisheye_json(colmap_path, images_folder, output_json="fisheye_cameras.json", fov_override=None, max_cameras=None):
     """
     COLMAP 데이터를 fisheye_cameras.json으로 변환
     
@@ -59,6 +82,7 @@ def colmap_to_fisheye_json(colmap_path, images_folder, output_json="fisheye_came
         images_folder: 이미지 폴더 경로 (예: data/images)
         output_json: 출력 JSON 파일 이름
         fov_override: FOV 수동 지정 (None이면 COLMAP 파라미터에서 자동 계산)
+        max_cameras: 최대 카메라 수 (None이면 전체 사용, 숫자면 균등 샘플링)
     """
     
     # COLMAP 데이터 읽기
@@ -77,7 +101,18 @@ def colmap_to_fisheye_json(colmap_path, images_folder, output_json="fisheye_came
     
     cameras = []
     
-    print(f"Processing {len(cam_extrinsics)} cameras...")
+    # 카메라 키 목록 (정렬해서 재현성 보장)
+    all_keys = sorted(cam_extrinsics.keys())
+    
+    # max_cameras가 지정되면 균등 샘플링
+    if max_cameras is not None and max_cameras < len(all_keys):
+        indices = np.linspace(0, len(all_keys) - 1, max_cameras, dtype=int)
+        selected_keys = [all_keys[i] for i in indices]
+        print(f"Sampling {max_cameras} cameras from {len(all_keys)} total (uniform)")
+    else:
+        selected_keys = all_keys
+    
+    print(f"Processing {len(selected_keys)} cameras...")
     
     # 카메라 intrinsics 정보 출력
     for cam_id, intr in cam_intrinsics.items():
@@ -94,7 +129,7 @@ def colmap_to_fisheye_json(colmap_path, images_folder, output_json="fisheye_came
             else:
                 print(f"    Using override FOV: {fov_override:.1f}°")
     
-    for idx, key in enumerate(cam_extrinsics):
+    for idx, key in enumerate(selected_keys):
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
         
@@ -108,12 +143,20 @@ def colmap_to_fisheye_json(colmap_path, images_folder, output_json="fisheye_came
         image_name = extr.name
         image_path = os.path.join(images_folder, image_name)
         
+        # 이미지가 없으면 basename으로도 시도
+        if not os.path.exists(image_path):
+            image_path = os.path.join(images_folder, os.path.basename(image_name))
+            image_name = os.path.basename(image_name)
+        
         # Get image size
         if os.path.exists(image_path):
             img = Image.open(image_path)
             width, height = img.size
         else:
-            print(f"Warning: Image not found: {image_path}, using COLMAP dimensions")
+            print(f"\n⚠ Warning: Image not found: {image_path}")
+            print(f"  COLMAP name: {extr.name}")
+            print(f"  Available files (first 5): {os.listdir(images_folder)[:5]}")
+            print(f"  Using COLMAP dimensions: {intr.width}x{intr.height}")
             width = intr.width
             height = intr.height
         
@@ -158,7 +201,7 @@ def colmap_to_fisheye_json(colmap_path, images_folder, output_json="fisheye_came
         }
         
         cameras.append(cam_dict)
-        print(f"  [{idx+1}/{len(cam_extrinsics)}] {image_name} (FOV={fov:.1f}°)")
+        print(f"  [{idx+1}/{len(selected_keys)}] {image_name} (FOV={fov:.1f}°)")
     
     # JSON 생성
     output_data = {
@@ -190,7 +233,9 @@ if __name__ == "__main__":
                         help="Output JSON filename")
     parser.add_argument("--fov", type=float, default=None,
                         help="Override fisheye FOV in degrees (auto-calculated from COLMAP params if not set)")
+    parser.add_argument("--max_cameras", type=int, default=None,
+                        help="Maximum number of cameras to include (uniformly sampled)")
     
     args = parser.parse_args()
     
-    colmap_to_fisheye_json(args.colmap, args.images, args.output, args.fov)
+    colmap_to_fisheye_json(args.colmap, args.images, args.output, args.fov, args.max_cameras)

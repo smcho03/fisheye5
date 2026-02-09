@@ -2,6 +2,7 @@
 # Fisheye Camera 지원 추가 함수들
 #
 import numpy as np
+from PIL import Image
 from scene.cameras import Camera, FisheyeCamera
 
 
@@ -70,9 +71,16 @@ def loadCam(args, id, cam_info, resolution_scale):
 
 def loadFisheyeCam(args, id, cam_info, resolution_scale):
     """
-    Fisheye Camera 로드
+    Fisheye Camera 로드 - image_path에서 직접 로드 (메모리 절약)
     """
-    orig_w, orig_h = cam_info.image.size
+    # cam_info.image가 None이면 image_path에서 로드
+    if cam_info.image is None:
+        with Image.open(cam_info.image_path) as img:
+            pil_image = img.copy()
+    else:
+        pil_image = cam_info.image
+    
+    orig_w, orig_h = pil_image.size
 
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
@@ -93,7 +101,10 @@ def loadFisheyeCam(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
+    resized_image_rgb = PILtoTorch(pil_image, resolution)
+    
+    # PIL image 해제 (메모리 절약)
+    del pil_image
 
     gt_image = resized_image_rgb[:3, ...]
     loaded_mask = None

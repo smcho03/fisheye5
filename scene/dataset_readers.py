@@ -111,7 +111,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depths_fold
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
+        with Image.open(image_path) as img:
+            image = img.copy()
 
         depth_params = {}
         depth_image = None
@@ -164,10 +165,15 @@ def readFisheyeCameras(fisheye_json_path, images_folder, depths_folder=None):
         # Load image
         image_path = os.path.join(images_folder, image_name)
         if not os.path.exists(image_path):
-            print(f"\nWarning: Image not found: {image_path}")
-            continue
+            # basename으로도 시도
+            image_path = os.path.join(images_folder, os.path.basename(image_name))
+            if not os.path.exists(image_path):
+                print(f"\nWarning: Image not found: {image_path}")
+                continue
         
-        image = Image.open(image_path)
+        # 이미지는 로드하지 않음 - loadFisheyeCam에서 image_path로 직접 로드
+        # 크기는 JSON에서 이미 가져옴
+        image = None
         
         # Load depth if available
         depth_params = {}
